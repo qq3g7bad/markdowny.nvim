@@ -267,6 +267,30 @@ local exit_visual_if_active = function()
         result.visual_mode = '\22'
     elseif mode == 'v' or mode == 'V' then
         result.visual_mode = mode
+        -- Capture visual bounds before exiting, since nvim_feedkeys('<Esc>')
+        -- may not set '<' and '>' marks synchronously in <Cmd> context.
+        local anchor = vim.fn.getpos('v')
+        local cursor = vim.fn.getpos('.')
+        local start_line = math.min(anchor[2], cursor[2])
+        local end_line = math.max(anchor[2], cursor[2])
+        local start_col, end_col
+        if anchor[2] < cursor[2] or (anchor[2] == cursor[2] and anchor[3] <= cursor[3]) then
+            start_col = anchor[3]
+            end_col = cursor[3]
+        else
+            start_col = cursor[3]
+            end_col = anchor[3]
+        end
+        if mode == 'V' then
+            start_col = 1
+            end_col = #get_line(end_line)
+        end
+        result.visual_bounds = {
+            start_line = start_line,
+            start_col = start_col,
+            end_line = end_line,
+            end_col = end_col,
+        }
     end
 
     -- Exit visual mode if active (sets the '<' and '>' marks)
@@ -288,7 +312,7 @@ end
 ---@param after string The string to insert after the selected text.
 ---@param remove boolean|nil Remove surround if possible (default true).
 ---@param block_info table|nil Captured block boundaries from exit_visual_if_active().
-local inline_surround = function(before, after, remove, block_info, captured_visual_mode)
+local inline_surround = function(before, after, remove, block_info, captured_visual_mode, visual_bounds)
     local visual_mode = captured_visual_mode or vim.fn.visualmode()
     local is_block = visual_mode == '\22'
 
@@ -298,6 +322,13 @@ local inline_surround = function(before, after, remove, block_info, captured_vis
     -- Validate marks exist
     if start_pos == nil or end_pos == nil then
         return
+    end
+
+    -- Use captured visual bounds if available (more reliable than marks
+    -- which may not be set synchronously after nvim_feedkeys('<Esc>'))
+    if visual_bounds then
+        start_pos = get_first_byte({ visual_bounds.start_line, visual_bounds.start_col })
+        end_pos = get_last_byte({ visual_bounds.end_line, visual_bounds.end_col })
     end
 
     -- In visual block mode, use captured block info for true boundaries
@@ -311,7 +342,8 @@ local inline_surround = function(before, after, remove, block_info, captured_vis
 
     -- Manually count chars of last selected line in V-LINE mode due
     -- to '>' reaching max int value. Address if it's neovim bug.
-    if visual_mode == 'V' then
+    -- Only needed when visual_bounds is not available (fallback path).
+    if not visual_bounds and visual_mode == 'V' then
         end_pos[2] = #get_line(end_pos[1])
     end
 
@@ -363,6 +395,7 @@ local inline_surround = function(before, after, remove, block_info, captured_vis
         -- In block mode, we need to check markers on trimmed content
         local is_removing
         local is_removing_full_lines = false
+        local is_removing_outer_block = false
         if is_block then
             is_removing = true
             if remove then
@@ -371,6 +404,23 @@ local inline_surround = function(before, after, remove, block_info, captured_vis
                     if not has_surround_markers(trimmed, before, after) then
                         is_removing = false
                         break
+                    end
+                end
+
+                -- If not removing inner markers, check for outer markers on each line
+                if not is_removing then
+                    local all_have_outer = true
+                    for i = start_pos[1], end_pos[1] do
+                        local line = get_line(i)
+                        local cs, ce = get_column_bounds(i, start_pos, end_pos, is_block, block_left_col, block_right_col)
+                        if not has_outer_markers(line, cs, ce, before, after) then
+                            all_have_outer = false
+                            break
+                        end
+                    end
+                    if all_have_outer then
+                        is_removing = true
+                        is_removing_outer_block = true
                     end
                 end
             else
@@ -407,18 +457,25 @@ local inline_surround = function(before, after, remove, block_info, captured_vis
             local transformed_text
 
             if is_block then
-                -- In block mode, preserve leading/trailing whitespace outside markers
-                local leading_ws = selected_text:match('^(%s*)')
-                local trailing_ws = selected_text:match('(%s*)$')
-                local content = selected_text:match('^%s*(.-)%s*$')
-
-                if is_removing then
-                    content = remove_surround_markers(content, before, after)
+                if is_removing_outer_block then
+                    -- Remove outer markers by expanding the replacement range
+                    col_start = col_start - #before
+                    col_end = col_end + #after
+                    transformed_text = selected_text
                 else
-                    content = add_surround_markers(content, before, after)
-                end
+                    -- In block mode, preserve leading/trailing whitespace outside markers
+                    local leading_ws = selected_text:match('^(%s*)')
+                    local trailing_ws = selected_text:match('(%s*)$')
+                    local content = selected_text:match('^%s*(.-)%s*$')
 
-                transformed_text = leading_ws .. content .. trailing_ws
+                    if is_removing then
+                        content = remove_surround_markers(content, before, after)
+                    else
+                        content = add_surround_markers(content, before, after)
+                    end
+
+                    transformed_text = leading_ws .. content .. trailing_ws
+                end
             else
                 if is_removing and is_removing_full_lines then
                     -- Remove markers from the full line content
@@ -495,12 +552,12 @@ end
 
 function M.bold()
     local ctx = exit_visual_if_active()
-    inline_surround('**', '**', nil, ctx.block_info, ctx.visual_mode)
+    inline_surround('**', '**', nil, ctx.block_info, ctx.visual_mode, ctx.visual_bounds)
 end
 
 function M.italic()
     local ctx = exit_visual_if_active()
-    inline_surround('_', '_', nil, ctx.block_info, ctx.visual_mode)
+    inline_surround('_', '_', nil, ctx.block_info, ctx.visual_mode, ctx.visual_bounds)
 end
 
 function M.code()
@@ -509,7 +566,7 @@ function M.code()
     if visual_mode == 'V' then
         newline_surround('```', '```')
     else
-        inline_surround('`', '`', nil, ctx.block_info, ctx.visual_mode)
+        inline_surround('`', '`', nil, ctx.block_info, ctx.visual_mode, ctx.visual_bounds)
     end
 end
 
@@ -519,7 +576,7 @@ function M.link()
         if href == nil then
             return
         end
-        inline_surround('[', '](' .. href .. ')', false, ctx.block_info, ctx.visual_mode)
+        inline_surround('[', '](' .. href .. ')', false, ctx.block_info, ctx.visual_mode, ctx.visual_bounds)
     end)
 end
 
