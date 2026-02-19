@@ -106,6 +106,22 @@ local has_surround_markers = function(text, before, after)
     return text:sub(1, #before) == before and text:sub(-#after) == after
 end
 
+-- Check if markers exist immediately outside the selection on the same line.
+---@param line string The full line text.
+---@param start_col integer The start column of the selection (1-indexed).
+---@param end_col integer The end column of the selection (1-indexed).
+---@param before string The marker expected before the selection.
+---@param after string The marker expected after the selection.
+---@return boolean @True if outer markers are found.
+---@nodiscard
+local has_outer_markers = function(line, start_col, end_col, before, after)
+    if start_col - #before < 1 then return false end
+    if end_col + #after > #line then return false end
+    local pre = line:sub(start_col - #before, start_col - 1)
+    local post = line:sub(end_col + 1, end_col + #after)
+    return pre == before and post == after
+end
+
 -- Remove surround markers from text.
 ---@param text string The text to remove markers from.
 ---@param before string The marker to remove from the start.
@@ -272,8 +288,8 @@ end
 ---@param after string The string to insert after the selected text.
 ---@param remove boolean|nil Remove surround if possible (default true).
 ---@param block_info table|nil Captured block boundaries from exit_visual_if_active().
-local inline_surround = function(before, after, remove, block_info)
-    local visual_mode = vim.fn.visualmode()
+local inline_surround = function(before, after, remove, block_info, captured_visual_mode)
+    local visual_mode = captured_visual_mode or vim.fn.visualmode()
     local is_block = visual_mode == '\22'
 
     local start_pos = get_first_byte(get_mark('<'))
@@ -295,7 +311,7 @@ local inline_surround = function(before, after, remove, block_info)
 
     -- Manually count chars of last selected line in V-LINE mode due
     -- to '>' reaching max int value. Address if it's neovim bug.
-    if vim.fn.visualmode() == 'V' then
+    if visual_mode == 'V' then
         end_pos[2] = #get_line(end_pos[1])
     end
 
@@ -317,10 +333,23 @@ local inline_surround = function(before, after, remove, block_info)
         local selected_text = text[1]
         local is_removing = has_surround_markers(selected_text, before, after) and remove
 
+        -- Check if markers exist immediately outside the selection
+        local is_removing_outer = false
+        if not is_removing and remove then
+            local line = get_line(start_pos[1])
+            is_removing_outer = has_outer_markers(line, start_pos[2], end_pos[2], before, after)
+        end
+
         if is_removing then
             local transformed_text = remove_surround_markers(selected_text, before, after)
             vim.api.nvim_buf_set_text(0, start_pos[1] - 1, start_pos[2] - 1, end_pos[1] - 1, end_pos[2], {transformed_text})
             end_pos[2] = end_pos[2] - #before - #after
+        elseif is_removing_outer then
+            vim.api.nvim_buf_set_text(
+                0, start_pos[1] - 1, start_pos[2] - 1 - #before,
+                end_pos[1] - 1, end_pos[2] + #after, {selected_text})
+            start_pos[2] = start_pos[2] - #before
+            end_pos[2] = end_pos[2] - #before
         else
             insert_text(start_pos, { before })
             end_pos[2] = end_pos[2] + #before + 1
@@ -333,6 +362,7 @@ local inline_surround = function(before, after, remove, block_info)
 
         -- In block mode, we need to check markers on trimmed content
         local is_removing
+        local is_removing_full_lines = false
         if is_block then
             is_removing = true
             if remove then
@@ -348,6 +378,25 @@ local inline_surround = function(before, after, remove, block_info)
             end
         else
             is_removing = remove and check_all_lines_have_surround(text, before, after)
+
+            -- Fallback: check each line's full content for per-line markers.
+            -- This handles cases where the selection doesn't perfectly align
+            -- with marker boundaries (e.g., V-line mode edge cases, or
+            -- character-wise selection across fully-bold lines).
+            if not is_removing and remove then
+                local all_lines_have_markers = true
+                for i = start_pos[1], end_pos[1] do
+                    local full_line = get_line(i)
+                    if not has_surround_markers(full_line, before, after) then
+                        all_lines_have_markers = false
+                        break
+                    end
+                end
+                if all_lines_have_markers then
+                    is_removing_full_lines = true
+                    is_removing = true
+                end
+            end
         end
 
         for i = start_pos[1], end_pos[1] do
@@ -371,7 +420,13 @@ local inline_surround = function(before, after, remove, block_info)
 
                 transformed_text = leading_ws .. content .. trailing_ws
             else
-                if is_removing then
+                if is_removing and is_removing_full_lines then
+                    -- Remove markers from the full line content
+                    local full_line = get_line(i)
+                    col_start = 1
+                    col_end = #full_line
+                    transformed_text = remove_surround_markers(full_line, before, after)
+                elseif is_removing then
                     transformed_text = remove_surround_markers(selected_text, before, after)
                 else
                     transformed_text = add_surround_markers(selected_text, before, after)
@@ -440,12 +495,12 @@ end
 
 function M.bold()
     local ctx = exit_visual_if_active()
-    inline_surround('**', '**', nil, ctx.block_info)
+    inline_surround('**', '**', nil, ctx.block_info, ctx.visual_mode)
 end
 
 function M.italic()
     local ctx = exit_visual_if_active()
-    inline_surround('_', '_', nil, ctx.block_info)
+    inline_surround('_', '_', nil, ctx.block_info, ctx.visual_mode)
 end
 
 function M.code()
@@ -454,7 +509,7 @@ function M.code()
     if visual_mode == 'V' then
         newline_surround('```', '```')
     else
-        inline_surround('`', '`', nil, ctx.block_info)
+        inline_surround('`', '`', nil, ctx.block_info, ctx.visual_mode)
     end
 end
 
@@ -464,7 +519,7 @@ function M.link()
         if href == nil then
             return
         end
-        inline_surround('[', '](' .. href .. ')', false, ctx.block_info)
+        inline_surround('[', '](' .. href .. ')', false, ctx.block_info, ctx.visual_mode)
     end)
 end
 
